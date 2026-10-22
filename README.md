@@ -47,15 +47,15 @@ Este script opera bajo un **enfoque estrictamente no destructivo**:
 
 ### Opción A: Clonar el repositorio (Recomendado)
 ```bash
-git clone https://github.com/TU_USUARIO/PHP2Shell-Auditor.git
-cd PHP2Shell-Auditor
+git clone https://github.com/jorgbot/PHP2Shell.git
+cd PHP2Shell
 chmod +x audit_php2shell.py
 ```
 
 ### Opción B: Instalación local vía pip (Comando CLI global)
 ```bash
-git clone https://github.com/TU_USUARIO/PHP2Shell-Auditor.git
-cd PHP2Shell-Auditor
+git clone https://github.com/jorgbot/PHP2Shell.git
+cd PHP2Shell
 pip install .
 # Ahora puede ejecutarse directamente como:
 php2shell-audit -u https://ejemplo.com
