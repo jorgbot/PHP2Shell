@@ -1,0 +1,5 @@
+# Lista de URLs de ejemplo para auditoría PHP2Shell
+# Formatos soportados: dominio simple o URL con esquema
+https://www.php.net
+https://wordpress.org
+https://laravel.com

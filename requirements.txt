@@ -1,0 +1,6 @@
+# Este proyecto utiliza exclusivamente la biblioteca estándar de Python 3 (urllib, ssl, json, csv, concurrent.futures).
+# No se requieren dependencias externas de terceros para su ejecución básica.
+#
+# Dependencias opcionales para desarrollo / testing:
+# flake8>=6.0.0
+# black>=23.0.0

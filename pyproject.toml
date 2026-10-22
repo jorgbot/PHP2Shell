@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php2shell-audit"
+version = "1.0.0"
+description = "Auditor de seguridad no destructivo en producción para PHP2Shell (CVE-2026-109618 / CVE-2026-109619)"
+readme = "README.md"
+authors = [{ name = "Security Research Team" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+php2shell-audit = "audit_php2shell:main"
