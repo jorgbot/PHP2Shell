@@ -6,7 +6,7 @@ PHP2Shell Enterprise Auditor & Reconnaissance Suite (CVE-2026-109618 / 109619)
 ===============================================================================
 Auditor de seguridad no destructivo para verificar la exposición a las
 vulnerabilidades críticas de PHP2Shell (RCE por OOM corruption y UAF de estado global)
-en URLs de producción.
+en URLs de producción y servidores locales.
 
 Marco de Exploración No Destructivo (OWASP / NIST SP 800-115 / OSSTMM):
 - Evaluación pasiva y heurística de versión y umbrales de seguridad.
@@ -15,17 +15,23 @@ Marco de Exploración No Destructivo (OWASP / NIST SP 800-115 / OSSTMM):
 - Fingerprinting de Sistema Operativo y Distribución Linux (para evaluar backports).
 - Detección de WAF, CDN y Proxies Inversos (Cloudflare, AWS WAF, Akamai, etc.).
 - Verificación de Hardening y Fugas de Configuración (expose_php, cabeceras HSTS/CSP).
-- Generación de reportes en Consola, JSON, CSV y Dashboard interactivo en HTML.
+- Inspección de Certificados SSL/TLS (vencimiento, versión TLS y emisor).
+- Auditoría de Configuración Local de Servidor / Contenedor (php.ini, disable_functions).
+- Exportación a Consola, JSON, CSV, Dashboard interactivo en HTML y formato estándar OASIS SARIF v2.1.0.
+- Integración de Alertas Webhook (Slack, Discord, Microsoft Teams, SOC).
 ===============================================================================
 """
 
 import argparse
 import csv
+from datetime import datetime, timezone
 import html
 import json
 import os
 import re
+import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -73,6 +79,7 @@ class AuditResult:
     sapi_detected: Optional[str] = None
     waf_detected: Optional[str] = None
     hardening_issues: List[str] = field(default_factory=list)
+    ssl_info: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
 
 
@@ -84,17 +91,19 @@ class PHP2ShellAuditor:
         insecure: bool = False,
         proxy: Optional[str] = None,
         deep_scan: bool = False,
+        check_ssl: bool = True,
         verbose: bool = False,
     ):
         self.timeout = timeout
         self.user_agent = user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 "
-            "(PHP2Shell-Audit/2.0)"
+            "(PHP2Shell-Enterprise-Audit/2.1)"
         )
         self.insecure = insecure
         self.proxy = proxy
         self.deep_scan = deep_scan
+        self.check_ssl = check_ssl
         self.verbose = verbose
 
         # Configuración SSL
@@ -139,9 +148,65 @@ class PHP2ShellAuditor:
             return e.code, resp_headers, body
 
     # -------------------------------------------------------------------------
+    # Módulo de Inspección Pasiva de SSL/TLS
+    # -------------------------------------------------------------------------
+    def inspect_ssl(self, url: str) -> Optional[Dict[str, Any]]:
+        """Extrae de forma no destructiva metadatos del certificado SSL/TLS."""
+        if not url.startswith("https://"):
+            return None
+
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port or 443
+
+        if not hostname:
+            return None
+
+        try:
+            ctx = ssl.create_default_context()
+            if self.insecure:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection((hostname, port), timeout=min(self.timeout, 5)) as sock:
+                with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert = ssock.getpeercert()
+                    tls_ver = ssock.version()
+                    cipher = ssock.cipher()
+
+                    if not cert:
+                        return {"tls_version": tls_ver, "issuer": "No verificado (insecure mode)"}
+
+                    not_after_str = cert.get("notAfter")
+                    days_left = None
+                    if not_after_str:
+                        # Formato típico: 'May 22 23:59:59 2027 GMT'
+                        try:
+                            expiry = datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+                            now = datetime.now(timezone.utc)
+                            days_left = (expiry - now).days
+                        except Exception:
+                            pass
+
+                    issuer_dict = dict(x[0] for x in cert.get("issuer", ()))
+                    issuer = (
+                        issuer_dict.get("organizationName")
+                        or issuer_dict.get("commonName")
+                        or "Desconocido"
+                    )
+
+                    return {
+                        "tls_version": tls_ver,
+                        "cipher": cipher[0] if cipher else "N/A",
+                        "issuer": issuer,
+                        "days_left": days_left,
+                    }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # -------------------------------------------------------------------------
     # Módulos de Fingerprinting No Destructivo
     # -------------------------------------------------------------------------
-
     @staticmethod
     def detect_os(server_banner: str, x_powered: str, body_text: str) -> Optional[str]:
         """Identifica el sistema operativo / distribución subyacente."""
@@ -173,7 +238,6 @@ class PHP2ShellAuditor:
         x_powered = headers.get("x-powered-by", "").lower()
         body_lower = body_text.lower()
 
-        # WordPress
         if (
             "wp-content" in body_lower
             or "wp-includes" in body_lower
@@ -183,31 +247,24 @@ class PHP2ShellAuditor:
         ):
             return "WordPress"
 
-        # Drupal
         if "drupal" in x_generator or "drupal.settings" in body_lower or "/sites/default/files" in body_lower:
             return "Drupal"
 
-        # Joomla
         if "joomla" in x_generator or "joomla_" in set_cookie or "/components/com_" in body_lower:
             return "Joomla"
 
-        # Laravel
         if "laravel_session" in set_cookie or "xsrf-token" in set_cookie:
             return "Laravel Framework"
 
-        # Symfony
         if "symfony" in set_cookie or "_sf2_attributes" in set_cookie:
             return "Symfony Framework"
 
-        # Moodle
         if "moodlesession" in set_cookie or "/theme/moodle" in body_lower:
             return "Moodle LMS"
 
-        # Magento / Adobe Commerce
         if "mage.cookies" in body_lower or "/skin/frontend/" in body_lower or "frontend=" in set_cookie:
             return "Magento / Adobe Commerce"
 
-        # PrestaShop
         if "prestashop" in x_powered or "prestashop-" in set_cookie or "prestashop" in body_lower:
             return "PrestaShop"
 
@@ -215,10 +272,7 @@ class PHP2ShellAuditor:
 
     @staticmethod
     def detect_sapi(server_banner: str, x_powered: str) -> Optional[str]:
-        """
-        Deduce la SAPI o arquitectura de ejecución de PHP.
-        Relevancia crítica para CVE-2026-109618/19: Apache mod_php tiene exposición máxima.
-        """
+        """Deduce la SAPI o arquitectura de ejecución de PHP."""
         banner_low = server_banner.lower()
         x_low = x_powered.lower()
 
@@ -266,15 +320,12 @@ class PHP2ShellAuditor:
         x_powered = headers.get("x-powered-by", "")
         server = headers.get("server", "")
 
-        # 1. expose_php
         if "php" in x_powered.lower():
             issues.append("Directiva 'expose_php' ACTIVA (filtra versión en X-Powered-By)")
 
-        # 2. Server Banner Verboso
         if re.search(r"apache/[0-9]+\.[0-9]+.*ubuntu|php/[0-9]", server, re.IGNORECASE):
             issues.append("Server banner divulga versión detallada y distribución de SO")
 
-        # 3. Cabeceras de Seguridad en HTTPS
         if url.startswith("https://"):
             if "strict-transport-security" not in headers:
                 issues.append("Falta cabecera HSTS (Strict-Transport-Security)")
@@ -288,7 +339,6 @@ class PHP2ShellAuditor:
         if headers.get("x-content-type-options", "").lower() != "nosniff":
             issues.append("Falta cabecera X-Content-Type-Options: nosniff")
 
-        # 4. Fugas pasivas de errores nativos de PHP
         if "fatal error:" in body_text.lower() or "uncaught exception" in body_text.lower():
             issues.append("Directiva 'display_errors' ACTIVA (fuga rutas internas o errores nativos)")
 
@@ -296,7 +346,6 @@ class PHP2ShellAuditor:
 
     @staticmethod
     def parse_version_tuple(ver_str: str) -> Optional[Tuple[int, int, int]]:
-        """Extrae la tupla (major, minor, patch) de una cadena como '8.3.10' o '7.4.33-1+ubuntu'."""
         match = re.search(r"(\d+)\.(\d+)\.(\d+)", ver_str)
         if match:
             return int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -307,7 +356,6 @@ class PHP2ShellAuditor:
 
     @classmethod
     def evaluate_php_version(cls, ver_str: str) -> Tuple[str, str, str]:
-        """Evalúa si la versión de PHP detectada es vulnerable a CVE-2026-109618 / 109619."""
         v_tuple = cls.parse_version_tuple(ver_str)
         if not v_tuple:
             return (
@@ -347,7 +395,6 @@ class PHP2ShellAuditor:
             )
 
     def audit(self, url: str) -> AuditResult:
-        """Audita una única URL con fingerprinting multi-módulo."""
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
@@ -355,6 +402,7 @@ class PHP2ShellAuditor:
         is_php = False
         detected_version: Optional[str] = None
         server_banner = ""
+        ssl_info = None
 
         try:
             status_code, headers, body = self._send_request(url, method="GET")
@@ -366,14 +414,15 @@ class PHP2ShellAuditor:
             except Exception:
                 pass
 
-            # 1. Ejecutar Fingerprinting de Ecosistema
+            if self.check_ssl and url.startswith("https://"):
+                ssl_info = self.inspect_ssl(url)
+
             os_detected = self.detect_os(server_banner, headers.get("x-powered-by", ""), body_text)
             cms_detected = self.detect_cms_and_framework(headers, body_text)
             waf_detected = self.detect_waf(headers)
             sapi_detected = self.detect_sapi(server_banner, headers.get("x-powered-by", ""))
             hardening_issues = self.audit_hardening(url, headers, body_text)
 
-            # 2. Detección de PHP
             x_powered = headers.get("x-powered-by", "")
             if "php" in x_powered.lower():
                 is_php = True
@@ -402,7 +451,6 @@ class PHP2ShellAuditor:
                 is_php = True
                 evidence.append(f"CMS/Framework PHP detectado: {cms_detected}")
 
-            # 3. Sondas no intrusivas adicionales si la versión está oculta
             if not detected_version and is_php:
                 easter_egg_url = urllib.parse.urljoin(url, "/?=PHPB8B5F2A0-8692-11d4-A2A1-003065CB33D7")
                 try:
@@ -415,7 +463,6 @@ class PHP2ShellAuditor:
                 except Exception:
                     pass
 
-            # 4. Escaneo profundo opcional (--deep)
             if self.deep_scan and not detected_version:
                 deep_paths = ["/info.php", "/phpinfo.php", "/test.php", "/version.php"]
                 for path in deep_paths:
@@ -432,7 +479,6 @@ class PHP2ShellAuditor:
                     except Exception:
                         continue
 
-            # 5. Evaluación final de vulnerabilidad
             if detected_version:
                 status, severity, desc = self.evaluate_php_version(detected_version)
                 evidence.append(desc)
@@ -458,6 +504,7 @@ class PHP2ShellAuditor:
                     sapi_detected=sapi_detected,
                     waf_detected=waf_detected,
                     hardening_issues=hardening_issues,
+                    ssl_info=ssl_info,
                 )
             elif is_php:
                 evidence.append("PHP está en ejecución pero 'expose_php = Off' oculta la versión exacta.")
@@ -483,6 +530,7 @@ class PHP2ShellAuditor:
                     sapi_detected=sapi_detected,
                     waf_detected=waf_detected,
                     hardening_issues=hardening_issues,
+                    ssl_info=ssl_info,
                 )
             else:
                 return AuditResult(
@@ -500,6 +548,7 @@ class PHP2ShellAuditor:
                     sapi_detected=sapi_detected,
                     waf_detected=waf_detected,
                     hardening_issues=hardening_issues,
+                    ssl_info=ssl_info,
                 )
 
         except urllib.error.URLError as e:
@@ -513,6 +562,7 @@ class PHP2ShellAuditor:
                 evidence=[f"Fallo de conexión de red: {str(e.reason)}"],
                 server_banner="",
                 status_code=None,
+                ssl_info=ssl_info,
                 error_message=str(e.reason),
             )
         except Exception as e:
@@ -526,8 +576,220 @@ class PHP2ShellAuditor:
                 evidence=[f"Error inesperado al auditar: {str(e)}"],
                 server_banner="",
                 status_code=None,
+                ssl_info=ssl_info,
                 error_message=str(e),
             )
+
+
+# -----------------------------------------------------------------------------
+# Módulo de Auditoría Local de Servidor / Contenedor (php.ini / php runtime)
+# -----------------------------------------------------------------------------
+
+def audit_local_system(ini_file: Optional[str] = None) -> Dict[str, Any]:
+    """Audita la instalación local de PHP en el servidor o contenedor."""
+    result: Dict[str, Any] = {
+        "php_installed": False,
+        "php_version": None,
+        "status": "UNKNOWN",
+        "ini_path": ini_file,
+        "directives": {},
+        "findings": [],
+        "critical_functions_disabled": True,
+    }
+
+    # 1. Verificar binario de PHP
+    try:
+        proc = subprocess.run(["php", "-v"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if proc.returncode == 0:
+            result["php_installed"] = True
+            v_match = re.search(r"PHP\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?[\w.-]*)", proc.stdout)
+            if v_match:
+                result["php_version"] = v_match.group(1)
+                st, sev, desc = PHP2ShellAuditor.evaluate_php_version(result["php_version"])
+                result["status"] = st
+                result["findings"].append(desc)
+    except Exception:
+        pass
+
+    # 2. Localizar archivo php.ini si no se proveyó
+    if not ini_file and result["php_installed"]:
+        try:
+            p_ini = subprocess.run(["php", "--ini"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            m_ini = re.search(r"Loaded Configuration File:\s*(.*)", p_ini.stdout)
+            if m_ini and m_ini.group(1).strip() and "(none)" not in m_ini.group(1):
+                ini_file = m_ini.group(1).strip()
+                result["ini_path"] = ini_file
+        except Exception:
+            pass
+
+    # 3. Analizar directivas de seguridad en php.ini
+    if ini_file and os.path.exists(ini_file):
+        try:
+            with open(ini_file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            directives = {
+                "memory_limit": r"^\s*memory_limit\s*=\s*(.*)",
+                "expose_php": r"^\s*expose_php\s*=\s*(.*)",
+                "display_errors": r"^\s*display_errors\s*=\s*(.*)",
+                "allow_url_fopen": r"^\s*allow_url_fopen\s*=\s*(.*)",
+                "allow_url_include": r"^\s*allow_url_include\s*=\s*(.*)",
+                "disable_functions": r"^\s*disable_functions\s*=\s*(.*)",
+            }
+
+            for k, pat in directives.items():
+                m = re.search(pat, content, re.MULTILINE | re.IGNORECASE)
+                if m:
+                    result["directives"][k] = m.group(1).strip()
+
+            # Evaluación de Directivas Críticas
+            mem = result["directives"].get("memory_limit", "128M")
+            result["findings"].append(f"Directiva memory_limit configurada en: {mem}")
+
+            if result["directives"].get("expose_php", "").lower() in ["on", "1", "true"]:
+                result["findings"].append("[Hardening] expose_php = On (deshabilítelo para ocultar la versión).")
+
+            if result["directives"].get("display_errors", "").lower() in ["on", "1", "true"]:
+                result["findings"].append("[Hardening] display_errors = On (deshabilítelo en producción).")
+
+            # disable_functions
+            df = result["directives"].get("disable_functions", "").lower()
+            dangerous = ["system", "exec", "passthru", "shell_exec", "proc_open", "popen"]
+            missing_df = [fn for fn in dangerous if fn not in df]
+            if missing_df:
+                result["critical_functions_disabled"] = False
+                result["findings"].append(f"[Hardening] Funciones de ejecución permitidas: {', '.join(missing_df)}")
+            else:
+                result["findings"].append("[OK] Funciones críticas de ejecución del sistema restringidas en disable_functions.")
+
+        except Exception as e:
+            result["findings"].append(f"Error al analizar php.ini: {e}")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Generador de Reportes OASIS SARIF v2.1.0 (GitHub Code Scanning Compatible)
+# -----------------------------------------------------------------------------
+
+def generate_sarif_report(results: List[AuditResult], output_path: str):
+    """Genera un reporte SARIF estándar compatible con GitHub Security / CodeQL."""
+    sarif_results = []
+    for r in results:
+        if r.status in ["VULNERABLE", "POTENTIALLY_VULNERABLE"]:
+            rule_id = "CVE-2026-109618" if r.status == "VULNERABLE" else "PHP2SHELL-POTENTIAL"
+            level = "error" if r.status == "VULNERABLE" else "warning"
+
+            message = (
+                f"URL {r.url} está expuesta a PHP2Shell. Versión detectada: {r.version_detected or 'Oculta'}."
+            )
+
+            sarif_results.append({
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": message},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": r.url},
+                            "region": {"startLine": 1, "startColumn": 1},
+                        }
+                    }
+                ],
+                "properties": {
+                    "severity": r.severity,
+                    "confidence": r.confidence,
+                    "evidence": r.evidence,
+                    "hardening_issues": r.hardening_issues,
+                },
+            })
+
+    sarif_doc = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "PHP2Shell-Auditor",
+                        "version": "2.1.0",
+                        "informationUri": "https://github.com/jorgbot/PHP2Shell",
+                        "rules": [
+                            {
+                                "id": "CVE-2026-109618",
+                                "name": "PHP2ShellOOMCorruption",
+                                "shortDescription": {
+                                    "text": "PHP Core Out-Of-Memory Remote Code Execution Vulnerability"
+                                },
+                                "defaultConfiguration": {"level": "error"},
+                                "helpUri": "https://github.com/jorgbot/PHP2Shell#1-contexto-de-las-vulnerabilidades",
+                            },
+                            {
+                                "id": "PHP2SHELL-POTENTIAL",
+                                "name": "PHP2ShellPotentialExposure",
+                                "shortDescription": {
+                                    "text": "PHP Engine detected with hidden version; manual review required"
+                                },
+                                "defaultConfiguration": {"level": "warning"},
+                                "helpUri": "https://github.com/jorgbot/PHP2Shell",
+                            },
+                        ],
+                    }
+                },
+                "results": sarif_results,
+            }
+        ],
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(sarif_doc, f, indent=2, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------------
+# Integración con Webhooks (Slack / Discord / Teams / SOC)
+# -----------------------------------------------------------------------------
+
+def send_webhook_alert(webhook_url: str, results: List[AuditResult], stats: Dict[str, int]) -> bool:
+    """Envía un resumen de alerta estructurado al Webhook configurado."""
+    vuln_count = stats.get("VULNERABLE", 0)
+    pot_count = stats.get("POTENTIALLY_VULNERABLE", 0)
+
+    color = 0xEF4444 if vuln_count > 0 else (0xF59E0B if pot_count > 0 else 0x10B981)
+    status_summary = (
+        f"🚨 ALERTA CRÍTICA: Se detectaron {vuln_count} host(s) vulnerables a PHP2Shell!"
+        if vuln_count > 0
+        else f"⚠️ Atención: {pot_count} host(s) corren PHP con versión oculta."
+    )
+
+    payload = {
+        "text": status_summary,
+        "attachments": [
+            {
+                "color": f"#{color:06x}",
+                "title": "Reporte de Auditoría PHP2Shell (CVE-2026-109618 / 109619)",
+                "fields": [
+                    {"title": "Vulnerables", "value": str(vuln_count), "short": True},
+                    {"title": "Potencialmente Expuestos", "value": str(pot_count), "short": True},
+                    {"title": "Parcheados", "value": str(stats.get("PATCHED", 0)), "short": True},
+                    {"title": "Total Escaneado", "value": str(len(results)), "short": True},
+                ],
+                "footer": "PHP2Shell Enterprise Reconnaissance Suite",
+                "ts": int(time.time()),
+            }
+        ],
+    }
+
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "PHP2Shell-Webhook/2.1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status in [200, 204]
+    except Exception:
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -541,7 +803,6 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
     pot = sum(1 for r in results if r.status == "POTENTIALLY_VULNERABLE")
     patched = sum(1 for r in results if r.status == "PATCHED")
     not_php = sum(1 for r in results if r.status == "NOT_PHP")
-    err = sum(1 for r in results if r.status == "ERROR")
 
     rows = []
     for r in results:
@@ -565,8 +826,17 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
         hard_html = (
             "".join(f"<li class='text-warn'>{html.escape(h)}</li>" for h in r.hardening_issues)
             if r.hardening_issues
-            else "<span class='text-muted'>Sin hallazgos pasivos</span>"
+            else "<span class='text-muted'>Sin hallazgos</span>"
         )
+
+        ssl_badge = "N/A"
+        if r.ssl_info:
+            if "error" in r.ssl_info:
+                ssl_badge = f"<span class='text-warn'>{html.escape(r.ssl_info['error'])}</span>"
+            else:
+                days = r.ssl_info.get("days_left")
+                days_txt = f"{days} días restantes" if days is not None else "Vigente"
+                ssl_badge = f"{html.escape(r.ssl_info.get('tls_version', 'TLS'))} ({days_txt})<br><small class='text-muted'>{html.escape(r.ssl_info.get('issuer', ''))}</small>"
 
         rows.append(f"""
         <tr>
@@ -577,6 +847,7 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
             <td>{html.escape(r.sapi_detected or 'Desconocido')}</td>
             <td>{html.escape(r.os_detected or 'No identificado')}</td>
             <td>{html.escape(r.waf_detected or 'Directo / Ninguno')}</td>
+            <td>{ssl_badge}</td>
             <td><ul class="ev-list">{ev_html}</ul></td>
             <td><ul class="ev-list">{hard_html}</ul></td>
         </tr>
@@ -599,7 +870,6 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
             --warning: #f59e0b;
             --success: #10b981;
             --info: #06b6d4;
-            --primary: #3b82f6;
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
@@ -649,11 +919,11 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
         table {{
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.9rem;
+            font-size: 0.88rem;
             text-align: left;
         }}
         th, td {{
-            padding: 14px 16px;
+            padding: 12px 14px;
             border-bottom: 1px solid var(--border);
             vertical-align: top;
         }}
@@ -661,7 +931,7 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
             background: rgba(0, 0, 0, 0.2);
             color: var(--text-muted);
             text-transform: uppercase;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             letter-spacing: 0.5px;
         }}
         tr:hover {{ background: rgba(255, 255, 255, 0.02); }}
@@ -669,7 +939,7 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
             display: inline-block;
             padding: 4px 8px;
             border-radius: 6px;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             font-weight: 600;
         }}
         .badge-danger {{ background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid var(--danger); }}
@@ -677,8 +947,8 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
         .badge-success {{ background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid var(--success); }}
         .badge-info {{ background: rgba(6, 182, 212, 0.2); color: #a5f3fc; border: 1px solid var(--info); }}
         .badge-secondary {{ background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid var(--text-muted); }}
-        .ev-list {{ list-style-type: none; font-size: 0.8rem; color: var(--text-muted); }}
-        .ev-list li {{ margin-bottom: 4px; }}
+        .ev-list {{ list-style-type: none; font-size: 0.78rem; color: var(--text-muted); }}
+        .ev-list li {{ margin-bottom: 3px; }}
         .text-warn {{ color: #fde68a; }}
         .text-muted {{ color: var(--text-muted); }}
         .footer {{
@@ -729,6 +999,7 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
                     <th>SAPI / Arquitectura</th>
                     <th>Sistema Operativo</th>
                     <th>WAF / CDN</th>
+                    <th>SSL / TLS</th>
                     <th>Evidencia</th>
                     <th>Hallazgos Hardening</th>
                 </tr>
@@ -740,7 +1011,7 @@ def generate_html_report(results: List[AuditResult], elapsed_time: float, output
     </div>
 
     <div class="footer">
-        Auditoría completada en {elapsed_time:.2f} segundos. Generado automáticamente por PHP2Shell Enterprise Auditor.
+        Auditoría completada en {elapsed_time:.2f} segundos. Generado automáticamente por PHP2Shell Enterprise Reconnaissance Suite.
     </div>
 </body>
 </html>
@@ -764,10 +1035,10 @@ def format_status_badge(status: str) -> str:
 
 def print_banner():
     banner = f"""
-{Colors.CYAN}╔═════════════════════════════════════════════════════════════════════════════════╗
-║   PHP2Shell Enterprise Reconnaissance Suite (CVE-2026-109618 / CVE-2026-109619) ║
-║         Auditoría No Destructiva • CMS • SAPI • OS • WAF • Hardening            ║
-╚═════════════════════════════════════════════════════════════════════════════════╝{Colors.RESET}
+{Colors.CYAN}╔═══════════════════════════════════════════════════════════════════════════════════════╗
+║     PHP2Shell Enterprise Reconnaissance Suite (CVE-2026-109618 / CVE-2026-109619)     ║
+║  CMS • SAPI • OS • WAF • Hardening • SSL • Local Audit • SARIF • Webhooks • HTML      ║
+╚═══════════════════════════════════════════════════════════════════════════════════════╝{Colors.RESET}
 """
     print(banner)
 
@@ -779,16 +1050,21 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-u", "--url", type=str, help="URL individual para auditar (ej. https://example.com)")
     group.add_argument("-f", "--file", type=str, help="Archivo de texto con lista de URLs (una por línea)")
+    group.add_argument("--audit-local", action="store_true", help="Auditar instalación local de PHP en servidor/contenedor")
 
+    parser.add_argument("--ini", type=str, default=None, help="Ruta específica a archivo php.ini para auditar localmente")
     parser.add_argument("-t", "--threads", type=int, default=5, help="Número de hilos concurrentes (default: 5)")
     parser.add_argument("--timeout", type=int, default=8, help="Timeout HTTP en segundos (default: 8)")
     parser.add_argument("--user-agent", type=str, default=None, help="User-Agent personalizado")
     parser.add_argument("-k", "--insecure", action="store_true", help="Ignorar errores de validación de certificados SSL")
     parser.add_argument("--proxy", type=str, default=None, help="Proxy HTTP/HTTPS (ej. http://127.0.0.1:8080)")
     parser.add_argument("--deep", action="store_true", help="Realizar sondeo profundo no invasivo (rutas info/diagnóstico)")
+    parser.add_argument("--no-ssl-check", action="store_true", help="Desactivar inspección pasiva de certificados SSL/TLS")
     parser.add_argument("-oJ", "--output-json", type=str, default=None, help="Ruta de archivo para guardar reporte en JSON")
     parser.add_argument("-oC", "--output-csv", type=str, default=None, help="Ruta de archivo para guardar reporte en CSV")
     parser.add_argument("-oH", "--output-html", type=str, default=None, help="Ruta para generar Dashboard interactivo en HTML")
+    parser.add_argument("-oS", "--output-sarif", type=str, default=None, help="Ruta para exportar en estándar OASIS SARIF v2.1.0")
+    parser.add_argument("--webhook", type=str, default=None, help="URL de Webhook (Slack/Discord/Teams/SOC) para alertas")
     parser.add_argument("-q", "--quiet", action="store_true", help="Modo silencioso, solo muestra resultados directos")
 
     args = parser.parse_args()
@@ -796,6 +1072,35 @@ def main():
     if not args.quiet:
         print_banner()
 
+    # -------------------------------------------------------------------------
+    # Flujo de Auditoría Local de Servidor / Contenedor
+    # -------------------------------------------------------------------------
+    if args.audit_local:
+        print(f"[*] Ejecutando auditoría local de runtime y php.ini...")
+        local_report = audit_local_system(args.ini)
+
+        status_color = Colors.GREEN if local_report["status"] == "PATCHED" else (
+            Colors.RED if local_report["status"] == "VULNERABLE" else Colors.YELLOW
+        )
+        print(f"\n{Colors.BOLD}Estado Local de PHP:{Colors.RESET}")
+        print(f"  PHP Instalado    : {'Sí' if local_report['php_installed'] else 'No'}")
+        print(f"  Versión Local    : {local_report['php_version'] or 'N/A'}")
+        print(f"  Evaluación       : {status_color}{local_report['status']}{Colors.RESET}")
+        print(f"  Archivo php.ini  : {local_report['ini_path'] or 'No encontrado'}")
+
+        print(f"\n{Colors.BOLD}Hallazgos de Configuración & Hardening:{Colors.RESET}")
+        for f in local_report["findings"]:
+            print(f"  ├─ {f}")
+
+        if args.output_json:
+            with open(args.output_json, "w", encoding="utf-8") as jf:
+                json.dump(local_report, jf, indent=2, ensure_ascii=False)
+            print(f"\n[+] Reporte local JSON guardado en: {args.output_json}")
+        sys.exit(0)
+
+    # -------------------------------------------------------------------------
+    # Flujo de Auditoría Remota de URLs
+    # -------------------------------------------------------------------------
     urls: List[str] = []
     if args.url:
         urls.append(args.url.strip())
@@ -819,11 +1124,12 @@ def main():
         insecure=args.insecure,
         proxy=args.proxy,
         deep_scan=args.deep,
+        check_ssl=not args.no_ssl_check,
     )
 
     if not args.quiet:
         print(f"[*] Iniciando auditoría sobre {len(urls)} objetivo(s) con {args.threads} hilo(s)...")
-        print(f"[*] Módulos activos: Versión, CMS/Framework, SAPI, Sistema Operativo, WAF/CDN, Hardening")
+        print(f"[*] Módulos: Versión, CMS/Framework, SAPI, SO, WAF/CDN, Hardening, SSL/TLS")
         print(f"{'-' * 80}\n")
 
     results: List[AuditResult] = []
@@ -850,10 +1156,9 @@ def main():
 
             print(f"{badge} {res.url} {ver_info} [{status_http}]")
             if not args.quiet:
-                # Mostrar contexto de reconocimiento
                 details = []
                 if res.cms_detected:
-                    details.append(f"CMS/App: {res.cms_detected}")
+                    details.append(f"CMS: {res.cms_detected}")
                 if res.sapi_detected:
                     details.append(f"SAPI: {res.sapi_detected}")
                 if res.os_detected:
@@ -863,6 +1168,9 @@ def main():
 
                 if details:
                     print(f"    ├─ {Colors.CYAN}Reconocimiento: {' | '.join(details)}{Colors.RESET}")
+
+                if res.ssl_info and "days_left" in res.ssl_info and res.ssl_info["days_left"] is not None:
+                    print(f"    ├─ {Colors.BLUE}SSL/TLS: {res.ssl_info.get('tls_version')} ({res.ssl_info['days_left']} días restantes - {res.ssl_info.get('issuer')}){Colors.RESET}")
 
                 if res.evidence:
                     for ev in res.evidence:
@@ -911,12 +1219,14 @@ def main():
                     "SAPI_Architecture",
                     "Operating_System",
                     "WAF_CDN",
+                    "SSL_Days_Left",
                     "Server_Banner",
                     "HTTP_Status",
                     "Hardening_Issues",
                     "Evidence",
                 ])
                 for r in results:
+                    ssl_days = r.ssl_info.get("days_left") if r.ssl_info else ""
                     writer.writerow([
                         r.url,
                         r.is_php,
@@ -928,6 +1238,7 @@ def main():
                         r.sapi_detected or "",
                         r.os_detected or "",
                         r.waf_detected or "",
+                        ssl_days if ssl_days is not None else "",
                         r.server_banner,
                         r.status_code or "",
                         " | ".join(r.hardening_issues),
@@ -946,6 +1257,25 @@ def main():
                 print(f"[+] Dashboard interactivo HTML generado en: {args.output_html}")
         except Exception as e:
             print(f"{Colors.RED}[!] Error al escribir HTML: {e}{Colors.RESET}", file=sys.stderr)
+
+    # Exportación a OASIS SARIF v2.1.0
+    if args.output_sarif:
+        try:
+            generate_sarif_report(results, args.output_sarif)
+            if not args.quiet:
+                print(f"[+] Reporte SARIF v2.1.0 generado en: {args.output_sarif}")
+        except Exception as e:
+            print(f"{Colors.RED}[!] Error al escribir SARIF: {e}{Colors.RESET}", file=sys.stderr)
+
+    # Envío de Alerta por Webhook si está configurado
+    if args.webhook:
+        if not args.quiet:
+            print(f"[*] Enviando alerta a Webhook...")
+        ok = send_webhook_alert(args.webhook, results, stats)
+        if ok and not args.quiet:
+            print(f"[+] Alerta enviada con éxito al Webhook.")
+        elif not ok:
+            print(f"{Colors.YELLOW}[!] No se pudo despachar la notificación al Webhook.{Colors.RESET}")
 
 
 if __name__ == "__main__":

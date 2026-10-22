@@ -1,0 +1,81 @@
+name: PHP2Shell Security Audit & Verification
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Ejecución programada semanal todos los lunes a las 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL específica para auditar'
+        required: false
+        default: 'https://www.php.net'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  validate-and-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Tests Unitarios de Evaluación de Versiones (CVE-2026-109618 / CVE-2026-109619)
+        run: |
+          python3 -c "
+          from audit_php2shell import PHP2ShellAuditor
+          cases = [
+              ('8.3.35', 'VULNERABLE'),
+              ('8.3.36', 'PATCHED'),
+              ('8.2.34', 'VULNERABLE'),
+              ('8.2.35', 'PATCHED'),
+              ('8.4.26', 'VULNERABLE'),
+              ('8.4.27', 'PATCHED'),
+              ('8.5.11', 'VULNERABLE'),
+              ('8.5.12', 'PATCHED'),
+              ('7.4.33', 'VULNERABLE'),
+              ('8.1.2', 'VULNERABLE')
+          ]
+          for v, expected in cases:
+              res, _, _ = PHP2ShellAuditor.evaluate_php_version(v)
+              assert res == expected, f'Error en versión {v}: esperado {expected}, obtenido {res}'
+          print('Todos los casos de prueba de mitigación pasaron exitosamente.')
+          "
+
+      - name: Ejecutar Auditoría Remota y Generar Reportes
+        run: |
+          chmod +x audit_php2shell.py
+          if [ -n "${{ github.event.inputs.target_url }}" ]; then
+            python3 audit_php2shell.py -u "${{ github.event.inputs.target_url }}" -oJ reporte.json -oC reporte.csv -oH dashboard.html -oS results.sarif
+          else
+            python3 audit_php2shell.py -f targets_example.txt -oJ reporte.json -oC reporte.csv -oH dashboard.html -oS results.sarif
+          fi
+
+      - name: Subir Resultados SARIF a GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: results.sarif
+
+      - name: Publicar Dashboard HTML como Artefacto
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: php2shell-audit-dashboard
+          path: |
+            dashboard.html
+            reporte.json
+            reporte.csv
